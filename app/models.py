@@ -57,6 +57,37 @@ class CorrectionIn(BaseModel):
         return _validate_temperature(v)
 
 
+class BatchIn(BaseModel):
+    """离线网关成批上报请求体：设备号 + 批次号 + 有序读数列表。
+
+    读数组沿用单条提交 ReadingIn 的全部校验（事件号、采样时间、温度）；
+    批内事件号重复属于请求本身无效，整批拒绝（422）。
+    读数按列表顺序视为有序内容参与“同批次号同内容”幂等判定。
+    """
+
+    batch_no: str = Field(
+        description="设备内唯一次批号（规则同事件号，字母 / 数字开头，≤ 64 字符）",
+        pattern=EVENT_NO_PATTERN,
+    )
+    readings: List[ReadingIn] = Field(min_length=1)
+
+    @field_validator("readings")
+    @classmethod
+    def no_duplicate_event_no_within_batch(cls, v: List[ReadingIn]) -> List[ReadingIn]:
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for item in v:
+            if item.event_no in seen and item.event_no not in duplicates:
+                duplicates.append(item.event_no)
+            seen.add(item.event_no)
+        if duplicates:
+            raise ValueError(
+                "event_no must be unique within a batch; duplicates: "
+                + ", ".join(duplicates)
+            )
+        return v
+
+
 class DisputeIn(BaseModel):
     """争议申请请求体。
 
@@ -166,6 +197,33 @@ class ReadingOut(BaseModel):
 class ReadingsResponse(BaseModel):
     device_id: str
     readings: List[ReadingOut]
+
+
+class BatchReadingResult(BaseModel):
+    """批内逐条读数的处理结果。"""
+
+    event_no: str
+    sampled_at: str = Field(description="规范化（UTC）后的采样时间")
+    temperature: float
+    status: Literal["created", "existed"] = Field(
+        description="created=本次新建；existed=库中已有同号同内容，仅标记已存在"
+    )
+
+
+class BatchReceiptResponse(BaseModel):
+    """批次提交回执：逐条新建 / 已存在状态 + 提交后全量区间 + 整批一次性差异。"""
+
+    device_id: str
+    batch_no: str
+    limit: float
+    results: List[BatchReadingResult] = Field(
+        description="按请求列表顺序给出的逐条处理结果"
+    )
+    intervals: List[Interval] = Field(description="该批提交后设备的全部有效超温区间")
+    changes: IntervalChanges = Field(
+        description="整批一次性区间差异（仅比较该批次提交前后，不按条拆分）"
+    )
+    created_at: str = Field(description="首次成功提交时间；同批次重试原样返回首次回执")
 
 
 class DisputeExecution(BaseModel):

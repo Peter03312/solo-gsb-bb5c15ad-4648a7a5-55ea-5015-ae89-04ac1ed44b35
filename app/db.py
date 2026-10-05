@@ -4,6 +4,8 @@ from contextlib import contextmanager
 
 # readings.revision 为单调修订号：初始为 1，每次更正 / 撤销（直接操作或争议批准执行）
 # 都会 +1。争议申请时冻结该修订号，批准时在同一事务内核对，不一致即判定为过期。
+# reading_batches 持久化离线网关每个批次号的规范化有序内容与首次回执：同批次重试
+# 按内容判同后原样返回首次回执，批次写入与回执存档在同一事务完成。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (
     device_id   TEXT NOT NULL,
@@ -35,6 +37,16 @@ CREATE TABLE IF NOT EXISTS disputes (
     execution          TEXT,             -- 首次决定的执行结果（JSON 存档，重试原样返回）
     created_at         TEXT NOT NULL,
     PRIMARY KEY (device_id, dispute_no)
+);
+
+CREATE TABLE IF NOT EXISTS reading_batches (
+    device_id   TEXT NOT NULL,
+    batch_no    TEXT NOT NULL,    -- 设备内唯一次批号（离线网关一批一报）
+    readings    TEXT NOT NULL,    -- 规范化后的有序读数内容（canonical JSON），重试按“整批同内容”判同
+    status      TEXT NOT NULL,    -- committed（整批成功提交；失败批次不留痕）
+    receipt     TEXT NOT NULL,    -- 首次回执（JSON 存档：逐条状态、全量区间、整批一次性差异）
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (device_id, batch_no)
 );
 """
 

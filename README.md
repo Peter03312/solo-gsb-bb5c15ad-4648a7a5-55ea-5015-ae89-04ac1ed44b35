@@ -4,6 +4,10 @@
 服务自动核验并维护**超温区间**；支持迟到补报、按事件号更正与撤销，并在每次写操作后
 重算受影响区间，返回当前全量区间及本次新增 / 变更 / 失效的区间差异。
 
+**离线网关**可把同一设备的多条读数延迟、成批上报：服务接收设备号、批次号和有序读数
+列表，在同一事务内整批校验、整批写入，逐条返回**新建 / 已存在**状态，并给出提交后的
+全量超温区间与**整批一次性**区间差异；同批次号同内容重试永远返回首次回执。
+
 此外支持**读数争议工作流**：对现有读数按争议号提出“更正采样时间与温度”或“撤销”，
 申请时冻结读数内容与**修订号**；待审争议可批准或驳回，批准时在同一事务内核对修订号，
 读数若已被直接操作或其他争议改变，争议转为**过期**且不再改读数。
@@ -67,6 +71,7 @@ Compose 中通过 `environment` 修改，例如 `TEMP_LIMIT: "2.0"`。
 | 方法   | 路径                                    | 说明                                       |
 | ------ | --------------------------------------- | ------------------------------------------ |
 | POST   | `/devices/{device_id}/readings`         | 提交读数（同号同内容幂等，同号异内容 409） |
+| POST   | `/devices/{device_id}/reading-batches`  | 离线网关成批上报（整批成功 / 整批拒绝，详见下节） |
 | PUT    | `/devices/{device_id}/readings/{event_no}` | 按事件号更正采样时间与温度              |
 | DELETE | `/devices/{device_id}/readings/{event_no}` | 按事件号撤销读数（重复撤销幂等）        |
 | GET    | `/devices/{device_id}/intervals`        | 查询当前全部超温区间                       |
@@ -142,6 +147,130 @@ curl $BASE/readings
 迟到补报示例：若已有 `E2(08:10, 9.0)`、`E3(08:20, 9.5)` 构成起点为 `E2` 的区间，
 补交一条更早的超限读数 `E1(08:00, 8.5)` 后，响应中 `changes.invalidated` 含旧区间
 `E2`、`changes.added` 含新区间 `E1`（起点改变 → 旧失效、新新增）。
+
+## 离线网关成批上报
+
+### 请求 `POST /devices/{device_id}/reading-batches`
+
+```json
+{
+  "batch_no": "GW-20261001-001",
+  "readings": [
+    {"event_no": "E1", "sampled_at": "2026-10-01T08:00:00Z", "temperature": 9.0},
+    {"event_no": "E2", "sampled_at": "2026-10-01T08:10:00Z", "temperature": 9.5},
+    {"event_no": "E3", "sampled_at": "2026-10-01T08:20:00Z", "temperature": 6.0}
+  ]
+}
+```
+
+- `batch_no`：设备内唯一次批号（规则同事件号，字母 / 数字开头，≤ 64 字符）；
+- `readings`：**非空**有序读数列表，逐条沿用现有事件号、采样时间、温度校验；
+  批内事件号必须唯一，重复即整批拒绝（`422`）。
+
+### 响应（首次成功 `201 Created`）
+
+```json
+{
+  "device_id": "truck-001",
+  "batch_no": "GW-20261001-001",
+  "limit": 8.0,
+  "results": [
+    {"event_no": "E1", "sampled_at": "2026-10-01T08:00:00.000000Z", "temperature": 9.0, "status": "created"},
+    {"event_no": "E2", "sampled_at": "2026-10-01T08:10:00.000000Z", "temperature": 9.5, "status": "created"},
+    {"event_no": "E3", "sampled_at": "2026-10-01T08:20:00.000000Z", "temperature": 6.0, "status": "created"}
+  ],
+  "intervals": [ /* 提交后的全量超温区间（结构同前） */ ],
+  "changes":   { "added": [], "changed": [], "invalidated": [] },
+  "created_at": "2026-10-05T21:06:30.505316Z"
+}
+```
+
+- `results[].status`：`created`（本次新建）或 `existed`（库中已有同号同内容，
+  仅标记已存在，不覆盖、修订号不变）；顺序与请求列表一致；
+- `intervals`：成功批次的新读数按现有 **(采样时间, 事件号)** 排序规则纳入后的
+  **全量**区间；
+- `changes`：**整批一次性**差异，只比较“批次提交前”与“批次提交后”，不按条拆分，
+  因此不会出现单条逐个写入时的中间态（例如一批内区间只会 `added` 一次，
+  不会先 `added` 再 `changed`）。
+
+### 整批拒绝（原子事务）
+
+出现以下任一情况时**整批拒绝**，原有读数、修订号与区间保持不变，且失败批次不留痕
+（同批次号修正后可重新首次提交）：
+
+| 情况 | 状态码 |
+| ---- | ------ |
+| 批内事件号重复；任一读数的时间 / 温度 / 事件号非法；读数列表为空 | `422` |
+| 任一读数与库中**同号异内容**（`detail` 会列出冲突事件号） | `409` |
+
+校验全部通过后才执行写入；批次读数与批次回执在**同一事务**提交。
+
+### 重试与冲突
+
+- **同批次号 + 规范化后的有序内容相同**（时间支持等价时区表示）：返回 `200` 与
+  **首次回执**（含首次的逐条状态、当时的全量区间与差异、`created_at`），
+  不重复写入、不重算；**即使该批读数之后被 `PUT` / `DELETE` 或争议决定修改 / 撤销，
+  首次回执也原样返回**。
+- **同批次号 + 异内容**（任一读数的时间 / 温度不同，或仅列表顺序不同）：`409`。
+  有序列表顺序是批次内容的一部分。
+- 批次号按设备隔离，不同设备可复用同一次批号。
+
+### 批次接口示例
+
+```bash
+BASE=http://localhost:8000/devices/truck-001
+
+# 1. 网关成批上报：3 条读数，E1、E2 连续超限，E3 闭合区间（整批一次性 added E1）
+curl -X POST $BASE/reading-batches -H 'Content-Type: application/json' -d '{
+  "batch_no":"GW-001",
+  "readings":[
+    {"event_no":"E1","sampled_at":"2026-10-01T08:00:00Z","temperature":9.0},
+    {"event_no":"E2","sampled_at":"2026-10-01T08:10:00Z","temperature":9.5},
+    {"event_no":"E3","sampled_at":"2026-10-01T08:20:00Z","temperature":6.0}
+  ]}'
+
+# 2. 网关重试（同批次号、等价时区的同内容）→ 200，返回与首次完全一致的回执
+curl -X POST $BASE/reading-batches -H 'Content-Type: application/json' -d '{
+  "batch_no":"GW-001",
+  "readings":[
+    {"event_no":"E1","sampled_at":"2026-10-01T16:00:00+08:00","temperature":9.0},
+    {"event_no":"E2","sampled_at":"2026-10-01T16:10:00+08:00","temperature":9.5},
+    {"event_no":"E3","sampled_at":"2026-10-01T16:20:00+08:00","temperature":6.0}
+  ]}'
+
+# 3. 第二批含一条已存在读数：E3 同号同内容 → existed；E4 新建 → created
+curl -X POST $BASE/reading-batches -H 'Content-Type: application/json' -d '{
+  "batch_no":"GW-002",
+  "readings":[
+    {"event_no":"E3","sampled_at":"2026-10-01T08:20:00Z","temperature":6.0},
+    {"event_no":"E4","sampled_at":"2026-10-01T08:30:00Z","temperature":5.5}
+  ]}'
+
+# 4. 批内重复事件号 → 422 整批拒绝
+curl -X POST $BASE/reading-batches -H 'Content-Type: application/json' -d '{
+  "batch_no":"GW-003",
+  "readings":[
+    {"event_no":"E9","sampled_at":"2026-10-01T09:00:00Z","temperature":9.0},
+    {"event_no":"E9","sampled_at":"2026-10-01T09:10:00Z","temperature":9.2}
+  ]}'
+
+# 5. 与库中同号异内容（E3 温度不同）→ 409 整批拒绝，E5 不会部分写入，GW-004 可修正后重用
+curl -X POST $BASE/reading-batches -H 'Content-Type: application/json' -d '{
+  "batch_no":"GW-004",
+  "readings":[
+    {"event_no":"E5","sampled_at":"2026-10-01T09:00:00Z","temperature":9.0},
+    {"event_no":"E3","sampled_at":"2026-10-01T08:20:00Z","temperature":7.0}
+  ]}'
+
+# 6. 同批次号异内容（仅顺序不同也算）→ 409
+curl -X POST $BASE/reading-batches -H 'Content-Type: application/json' -d '{
+  "batch_no":"GW-001",
+  "readings":[
+    {"event_no":"E2","sampled_at":"2026-10-01T08:10:00Z","temperature":9.5},
+    {"event_no":"E1","sampled_at":"2026-10-01T08:00:00Z","temperature":9.0},
+    {"event_no":"E3","sampled_at":"2026-10-01T08:20:00Z","temperature":6.0}
+  ]}'
+```
 
 ## 读数争议工作流
 
@@ -278,18 +407,20 @@ curl $BASE/disputes/D1              # 单个争议（含冻结依据、终态、
 
 - 原有读数与区间接口的**请求、响应与幂等语义完全不变**（仅内部新增 `revision` 列，
   不在原读数 / 区间响应中暴露）；
-- 升级旧版本数据库时自动幂等迁移：旧读数补列 `revision = 1`，无需手工脚本，
-  现有 `uvicorn app.main:app` 启动方式保持可用。
+- 新增批次表 `reading_batches` 与原表、争议表相互独立，批次提交只复用既有读数写入
+  与区间规则，不改变单条读数 / 争议接口的行为；
+- 升级旧版本数据库时自动幂等迁移：旧读数补列 `revision = 1`，新表自动创建，
+  无需手工脚本，现有 `uvicorn app.main:app` 启动方式保持可用。
 
 ## 错误码
 
 | 状态码 | 场景                                                                 |
 | ------ | -------------------------------------------------------------------- |
-| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试）        |
-| 201    | 争议首次申请成功                                                     |
+| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试） |
+| 201    | 争议首次申请成功；批次首次提交成功                                   |
 | 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号 |
-| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定 |
-| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值 |
+| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定；同批次号异内容；批次中任一读数与库中同号异内容（整批拒绝） |
+| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号 |
 
 错误响应体均含 `detail` 字段说明原因。
 
@@ -304,14 +435,15 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由、事务内重算区间、争议工作流、错误处理
+  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、错误处理
   intervals.py  # 区间计算与差异比对（纯函数）
-  models.py     # 请求/响应模型与输入校验（含争议申请 / 决定模型）
-  db.py         # SQLite 连接、建表与旧库 revision 增量迁移
+  models.py     # 请求/响应模型与输入校验（含批次、争议申请 / 决定模型）
+  db.py         # SQLite 连接、建表（读数 / 争议 / 批次）与旧库 revision 增量迁移
   config.py     # 环境变量配置
   util.py       # 时间规范化（UTC、固定宽度，保证可排序）
 tests/
   test_api.py       # 原读数 / 区间接口测试（语义不变）
+  test_batches.py   # 离线网关成批上报测试（整批事务、逐条状态、一次性差异、重试回执）
   test_disputes.py  # 争议工作流测试（冻结、批准 / 驳回、过期、幂等、迁移）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

@@ -12,6 +12,8 @@ from .config import Settings, get_settings
 from .db import connect, init_db
 from .intervals import compute_intervals, diff_intervals
 from .models import (
+    BatchIn,
+    BatchReceiptResponse,
     CorrectionIn,
     DecisionIn,
     DisputeIn,
@@ -37,11 +39,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="冷链运输温度事件核验服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "按设备提交 / 更正 / 撤销温度读数，自动核验并维护超温区间。"
         "连续两次有效读数超过上限即形成超温区间，区间以起点事件号标识。"
-        "另支持按争议号对读数提出更正 / 撤销争议：申请时冻结读数与修订号，"
+        "另支持离线网关按批次号成批上报：整批成功或整批拒绝，逐条返回"
+        "新建 / 已存在状态，并给出提交后全量区间与整批一次性差异，"
+        "同批次号同内容重试返回首次回执。"
+        "还支持按争议号对读数提出更正 / 撤销争议：申请时冻结读数与修订号，"
         "批准时在同一事务内核对修订号，读数已被改变则争议转为过期。"
     ),
     lifespan=lifespan,
@@ -234,6 +239,150 @@ def revoke_reading(
         _apply_revocation(conn, device_id, event_no)
 
     return _mutate(settings, device_id, op)
+
+
+# ---------------------------------------------------------------- 批量提交（离线网关）
+
+def _canonical_batch(items: list[tuple[str, str, float]]) -> str:
+    """规范化后的有序批次内容：(事件号, UTC 采样时间, 温度) 列表的 canonical JSON。
+
+    同批次号重试时按它判定“同内容”：顺序或任一读数不同即视为异内容冲突。
+    separators 去空格、sort_keys=False 保留列表顺序，保证同一内容字节一致。
+    """
+    return json.dumps(
+        [[event_no, sampled_at, temperature]
+         for event_no, sampled_at, temperature in items],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+@app.post(
+    "/devices/{device_id}/reading-batches",
+    response_model=BatchReceiptResponse,
+    status_code=201,
+    summary="离线网关成批上报读数（整批成功或整批拒绝；同批次号同内容重试返回首次回执）",
+)
+def submit_batch(
+    device_id: str,
+    body: BatchIn,
+    settings: Settings = Depends(get_settings),
+):
+    # 时间统一规范化为 UTC 后再入库 / 比较（与单条提交相同的等价时区语义）
+    normalized = [
+        (r.event_no, to_utc_iso(r.sampled_at), r.temperature) for r in body.readings
+    ]
+    canonical = _canonical_batch(normalized)
+
+    with connect(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing_batch = conn.execute(
+                "SELECT readings, receipt FROM reading_batches "
+                "WHERE device_id = ? AND batch_no = ?",
+                (device_id, body.batch_no),
+            ).fetchone()
+            if existing_batch is not None:
+                # 批次号已占用：查存档，内容一致则原样返回首次回执（即使读数
+                # 随后被更正 / 撤销 / 争议改变）；异内容一律冲突，不重放。
+                if existing_batch["readings"] != canonical:
+                    conn.rollback()
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"batch_no '{body.batch_no}' already exists on device "
+                            f"'{device_id}' with different content"
+                        ),
+                    )
+                receipt = json.loads(existing_batch["receipt"])
+                conn.commit()
+                return JSONResponse(status_code=200, content=receipt)
+
+            # 先做全部校验，再执行任何写入：任一读数同号异内容 → 整批拒绝，
+            # 已有读数、修订号与区间保持不变。
+            conflicts: list[str] = []
+            statuses: list[str] = []
+            for event_no, sampled_at, temperature in normalized:
+                existing = _get_reading(conn, device_id, event_no)
+                if existing is None:
+                    statuses.append("created")
+                    continue
+                same = (
+                    existing["sampled_at"] == sampled_at
+                    and existing["temperature"] == temperature
+                )
+                if same:
+                    statuses.append("existed")
+                else:
+                    conflicts.append(event_no)
+            if conflicts:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"batch rejected: event_no(s) already exist on device "
+                        f"'{device_id}' with different content: "
+                        f"{', '.join(conflicts)}"
+                    ),
+                )
+
+            before = _current_intervals(conn, device_id, settings.temp_limit)
+            now = utc_now_iso()
+            for (event_no, sampled_at, temperature), status in zip(
+                normalized, statuses
+            ):
+                if status == "existed":
+                    continue  # 同号同内容仅标记已存在，不覆盖、不改修订号
+                conn.execute(
+                    "INSERT INTO readings "
+                    "(device_id, event_no, sampled_at, temperature, revoked, revision, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 0, 1, ?, ?)",
+                    (device_id, event_no, sampled_at, temperature, now, now),
+                )
+            after = _current_intervals(conn, device_id, settings.temp_limit)
+
+            receipt = {
+                "device_id": device_id,
+                "batch_no": body.batch_no,
+                "limit": settings.temp_limit,
+                "results": [
+                    {
+                        "event_no": event_no,
+                        "sampled_at": sampled_at,
+                        "temperature": temperature,
+                        "status": status,
+                    }
+                    for (event_no, sampled_at, temperature), status in zip(
+                        normalized, statuses
+                    )
+                ],
+                # 成功批次按既有 (采样时间, 事件号) 规则纳入区间；
+                # 差异整批一次性计算，只比较批次前后。
+                "intervals": after,
+                "changes": diff_intervals(before, after),
+                "created_at": now,
+            }
+            # 批次写入与回执持久化在同一事务完成
+            conn.execute(
+                "INSERT INTO reading_batches "
+                "(device_id, batch_no, readings, status, receipt, created_at) "
+                "VALUES (?, ?, ?, 'committed', ?, ?)",
+                (
+                    device_id,
+                    body.batch_no,
+                    canonical,
+                    json.dumps(receipt, ensure_ascii=False),
+                    now,
+                ),
+            )
+            conn.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+    return receipt
 
 
 # ---------------------------------------------------------------- 争议工作流
@@ -624,7 +773,7 @@ def health():
 def root(settings: Settings = Depends(get_settings)):
     return {
         "service": "coldchain-temperature-verification",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "temp_limit": settings.temp_limit,
         "docs": "/docs",
     }
