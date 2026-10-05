@@ -36,6 +36,17 @@ CREATE TABLE IF NOT EXISTS disputes (
     created_at         TEXT NOT NULL,
     PRIMARY KEY (device_id, dispute_no)
 );
+
+-- 离线网关成批上报：批次回执存档。整批写入与回执在同一事务内完成；
+-- 同批次号 + 规范化后的有序内容重试时原样返回首次回执，异内容则 409。
+CREATE TABLE IF NOT EXISTS reading_batches (
+    device_id      TEXT NOT NULL,
+    batch_no       TEXT NOT NULL,        -- 设备内唯一批次号
+    request_hash   TEXT NOT NULL,        -- 规范化后有序内容的指纹（幂等 / 冲突判定）
+    receipt        TEXT NOT NULL,        -- 首次回执全文（JSON），重试原样返回
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (device_id, batch_no)
+);
 """
 
 # 旧版本库（无 revision 列）的一次性迁移；默认值 1 即历史读数的初始修订号。

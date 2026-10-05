@@ -168,6 +168,67 @@ class ReadingsResponse(BaseModel):
     readings: List[ReadingOut]
 
 
+class ReadingBatchIn(BaseModel):
+    """离线网关成批上报请求体：批次号 + 有序读数列表。
+
+    列表至少一条；批内事件号不得重复（由路由层按规范化内容检查）。
+    每条读数沿用单条提交 ReadingIn 的全部校验（事件号、时间、温度）。
+    """
+
+    batch_no: str = Field(
+        description="设备内唯一批次号（字母 / 数字 / `.` `_` `-`，≤ 64 字符）",
+        pattern=EVENT_NO_PATTERN,
+    )
+    readings: List[ReadingIn] = Field(
+        min_length=1, description="本批次的有序读数列表（网关上报顺序，至少一条）"
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def no_duplicate_event_no_within_batch(cls, v: List["ReadingIn"]) -> List["ReadingIn"]:
+        # 批内事件号重复属于无效请求：整批拒绝，422，不写任何数据
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for item in v:
+            if item.event_no in seen and item.event_no not in duplicates:
+                duplicates.append(item.event_no)
+            seen.add(item.event_no)
+        if duplicates:
+            raise ValueError(
+                "duplicate event_no within batch: " + ", ".join(sorted(duplicates))
+            )
+        return v
+
+
+class BatchReadingResult(BaseModel):
+    """批内单条读数的处理结果（顺序与请求列表一致）。"""
+
+    event_no: str
+    status: Literal["created", "existed"] = Field(
+        description="created=本次新建；existed=库中已有同号同内容读数（幂等标记）"
+    )
+
+
+class ReadingBatchResponse(BaseModel):
+    """批次上报回执：逐条结果 + 提交后全量区间 + 整批一次性区间差异。
+
+    回执随批次持久化；同批次号同内容重试时原样返回首次回执。
+    """
+
+    device_id: str
+    batch_no: str
+    limit: float
+    results: List[BatchReadingResult] = Field(
+        description="逐条读数处理结果，顺序与请求列表一致"
+    )
+    intervals: List[Interval] = Field(
+        description="批次提交完成后该设备的全部有效超温区间"
+    )
+    changes: IntervalChanges = Field(
+        description="整批一次性区间差异：仅比较批次前与批次后，不含批内中间态"
+    )
+
+
 class DisputeExecution(BaseModel):
     """争议决定的执行结果（终态后随争议一起返回，重放时原样回传首次结果）。"""
 

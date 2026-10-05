@@ -1,4 +1,5 @@
 """冷链运输温度事件核验服务 HTTP API。"""
+import hashlib
 import json
 import math
 from contextlib import asynccontextmanager
@@ -18,6 +19,8 @@ from .models import (
     DisputeListResponse,
     DisputeResponse,
     IntervalsResponse,
+    ReadingBatchIn,
+    ReadingBatchResponse,
     ReadingIn,
     ReadingsResponse,
 )
@@ -37,10 +40,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="冷链运输温度事件核验服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "按设备提交 / 更正 / 撤销温度读数，自动核验并维护超温区间。"
         "连续两次有效读数超过上限即形成超温区间，区间以起点事件号标识。"
+        "另支持离线网关按批次号成批上报：整批校验、整批事务写入并持久化首次回执，"
+        "同批次号同内容重试返回首次回执、异内容冲突。"
         "另支持按争议号对读数提出更正 / 撤销争议：申请时冻结读数与修订号，"
         "批准时在同一事务内核对修订号，读数已被改变则争议转为过期。"
     ),
@@ -179,6 +184,128 @@ def submit_reading(
         )
 
     return _mutate(settings, device_id, op)
+
+
+# ---------------------------------------------------------------- 批次上报
+
+def _batch_request_hash(items: list[tuple[str, str, float]]) -> str:
+    """规范化后有序批次内容的指纹。
+
+    items 已按请求顺序归一化为 (event_no, UTC 采样时间, 温度)；
+    列表顺序属于内容的一部分。同批次号凭此判定“同内容重试 / 异内容冲突”。
+    """
+    blob = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+@app.post(
+    "/devices/{device_id}/reading-batches",
+    response_model=ReadingBatchResponse,
+    responses={200: {"model": ReadingBatchResponse}, 201: {"model": ReadingBatchResponse}},
+    summary="离线网关成批上报读数（整批校验 / 整批事务；同批次号同内容返回首次回执）",
+)
+def submit_reading_batch(
+    device_id: str,
+    body: ReadingBatchIn,
+    settings: Settings = Depends(get_settings),
+):
+    # 归一化在事务前完成（纯计算）：批内重复已由模型拦截，这里仅做时间归一化
+    norm_items = [
+        (item.event_no, to_utc_iso(item.sampled_at), item.temperature)
+        for item in body.readings
+    ]
+    request_hash = _batch_request_hash(norm_items)
+
+    with connect(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            batch = conn.execute(
+                "SELECT request_hash, receipt FROM reading_batches "
+                "WHERE device_id = ? AND batch_no = ?",
+                (device_id, body.batch_no),
+            ).fetchone()
+            if batch is not None:
+                if batch["request_hash"] == request_hash:
+                    # 同批次号 + 规范化后同内容重试：原样返回首次回执（200），
+                    # 即使此后读数被更正 / 撤销或争议决定改变也不重算
+                    conn.rollback()
+                    return JSONResponse(
+                        status_code=200, content=json.loads(batch["receipt"])
+                    )
+                # 同批次号异内容：冲突，不触碰任何读数
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"batch_no '{body.batch_no}' already exists on device "
+                        f"'{device_id}' with different normalized content"
+                    ),
+                )
+
+            before = _current_intervals(conn, device_id, settings.temp_limit)
+            now = utc_now_iso()
+            results = []
+            for event_no, sampled_at, temperature in norm_items:
+                existing = _get_reading(conn, device_id, event_no)
+                if existing is not None:
+                    same = (
+                        existing["sampled_at"] == sampled_at
+                        and existing["temperature"] == temperature
+                    )
+                    if not same:
+                        # 与库中同号异内容：整批拒绝，原有读数 / 修订号 / 区间均不变
+                        conn.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"batch rejected: event_no '{event_no}' already exists "
+                                f"on device '{device_id}' with different content; "
+                                f"no readings in this batch were written"
+                            ),
+                        )
+                    results.append({"event_no": event_no, "status": "existed"})
+                    continue
+                conn.execute(
+                    "INSERT INTO readings "
+                    "(device_id, event_no, sampled_at, temperature, revoked, revision, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 0, 1, ?, ?)",
+                    (device_id, event_no, sampled_at, temperature, now, now),
+                )
+                results.append({"event_no": event_no, "status": "created"})
+
+            # 新区间按既有规则由全部有效读数按 (采样时间, 事件号) 排序重算，
+            # 与批次内列表顺序无关；差异只比较批次前与批次后（整批一次性）
+            after = _current_intervals(conn, device_id, settings.temp_limit)
+            receipt = {
+                "device_id": device_id,
+                "batch_no": body.batch_no,
+                "limit": settings.temp_limit,
+                "results": results,
+                "intervals": after,
+                "changes": diff_intervals(before, after),
+            }
+            # 批次写入与回执持久化在同一事务完成
+            conn.execute(
+                "INSERT INTO reading_batches "
+                "(device_id, batch_no, request_hash, receipt, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    body.batch_no,
+                    request_hash,
+                    json.dumps(receipt, ensure_ascii=False),
+                    now,
+                ),
+            )
+            conn.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+    # 首次成功：201 Created
+    return JSONResponse(status_code=201, content=receipt)
 
 
 @app.put(
@@ -624,7 +751,7 @@ def health():
 def root(settings: Settings = Depends(get_settings)):
     return {
         "service": "coldchain-temperature-verification",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "temp_limit": settings.temp_limit,
         "docs": "/docs",
     }
